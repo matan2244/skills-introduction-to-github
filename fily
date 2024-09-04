@@ -1,0 +1,125 @@
+import os
+import aiohttp
+import asyncio
+import nest_asyncio
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+
+nest_asyncio.apply()
+
+def log_message(message, log_file):
+    with open(log_file, 'a') as log:
+        log.write(message + '\n')
+    print(message)  # Print the log message to the console
+
+# Test the log_message function
+download_dir = '\\workspace\\downloads'
+log_file = os.path.join(download_dir, 'download_log.txt')
+if not os.path.exists(download_dir):
+    os.makedirs(download_dir)
+log_message('Test log message', log_file)
+
+async def download_chunk(session, url, start, end, filename, chunk_num, download_dir, log_file):
+    headers = {'Range': f'bytes={start}-{end}'}
+    async with session.get(url, headers=headers) as response:
+        chunk_filename = os.path.join(download_dir, f"{filename}.part{chunk_num}")
+        with open(chunk_filename, 'wb') as file:
+            while True:
+                chunk = await response.content.read(1024)
+                if not chunk:
+                    break
+                file.write(chunk)
+        log_message(f'Chunk {chunk_num} of {filename} downloaded successfully.', log_file)
+
+async def merge_chunks(filename, num_chunks, download_dir, log_file):
+    with open(os.path.join(download_dir, filename), 'wb') as output_file:
+        for i in range(num_chunks):
+            chunk_filename = os.path.join(download_dir, f"{filename}.part{i}")
+            with open(chunk_filename, 'rb') as chunk_file:
+                output_file.write(chunk_file.read())
+            os.remove(chunk_filename)
+    log_message(f'{filename} merged successfully.', log_file)
+
+async def download_file_in_chunks(session, url, filename, download_dir, log_file):
+    async with session.head(url) as response:
+        file_size = int(response.headers['Content-Length'])
+        # Determine the number of chunks based on file size
+        if file_size < 50 * 1024 * 1024:  # Less than 50 MB
+            num_chunks = 4
+        elif file_size < 500 * 1024 * 1024:  # 50 MB to 500 MB
+            num_chunks = 8
+        else:  # Greater than 500 MB
+            num_chunks = 16
+
+        chunk_size = file_size // num_chunks
+
+        os.makedirs(download_dir, exist_ok=True)
+
+        tasks = []
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = start + chunk_size - 1 if i < num_chunks - 1 else file_size - 1
+            tasks.append(download_chunk(session, url, start, end, filename, i, download_dir, log_file))
+
+        await asyncio.gather(*tasks)
+        await merge_chunks(filename, num_chunks, download_dir, log_file)
+
+async def download_all_elements(image_url, download_dir='\\workspace\\downloads', log_file='\\workspace\\downloads\\download_log.txt'):
+    # Use Selenium to fetch the dynamically loaded HTML
+    log_message('Attempting to fetch HTML from Civitai page using Selenium...', log_file)
+    options = webdriver.ChromeOptions()
+    options.add_argument('--headless')
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    driver.get(image_url)
+
+    try:
+        # Wait for the ul element with class containing "flex-list" to be present
+        ul_element = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'ul[class*="flex-list"]'))
+        )
+        html = driver.page_source
+        driver.quit()
+    except Exception as e:
+        log_message(f'Error fetching HTML: {e}', log_file)
+        driver.quit()
+        return
+
+    soup = BeautifulSoup(html, 'html.parser')
+    ul_element = soup.find('ul', class_=lambda x: x and 'flex-list' in x)
+    if not ul_element:
+        log_message('No ul element with class containing "flex-list" found. Printing HTML:', log_file)
+        log_message(soup.prettify(), log_file)
+        return
+
+    file_extensions = ['.zip', '.pt', '.bin', '.ckpt', '.safetensors']
+
+    tasks = []
+    total_files = 0
+    for li in ul_element.find_all('li'):
+        link = li.find('a', href=True)
+        if link:
+            file_url = link['href']
+            official_name = link.text.strip() or f"download_{total_files + 1}"
+            if any(file_url.endswith(ext) for ext in file_extensions):
+                filename = f"download_{total_files + 1}.zip"
+                log_message(f'File to be downloaded: Name: {official_name}, URL: {file_url}, Filename: {filename}', log_file)
+                tasks.append(download_file_in_chunks(session, file_url, filename, download_dir, log_file))
+                total_files += 1
+
+    log_message(f'Total number of files to be downloaded: {total_files}', log_file)
+    await asyncio.gather(*tasks)
+
+# To run the download_all_elements function in Jupyter, use:
+# await download_all_elements(image_url, download_dir, log_file)
+# Replace with your image URL
+image_url = 'https://civitai.com/images/23250143'
+download_dir = '\\workspace\\downloads'
+log_file = os.path.join(download_dir, 'download_log.txt')
+
+# Run the async download function
+await download_all_elements(image_url, download_dir, log_file)
